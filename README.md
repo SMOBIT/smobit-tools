@@ -5,6 +5,7 @@ Tool-Server mit verschiedenen APIs für n8n Integration. Kann einfach über Cool
 ## Features
 
 - PDF Parser (URL oder Base64)
+- S/MIME Parser (verschlüsselte/signierte E-Mails entpacken)
 - API-Key Authentifizierung
 - Rate Limiting (100 Requests / 15 Min)
 - File-Size Limits (Max 10MB)
@@ -176,6 +177,86 @@ curl -X POST http://localhost:3000/parse/pdf \
 }
 ```
 
+### POST /parse/smime
+
+S/MIME verschlüsselte oder signierte Nachrichten entpacken und Inhalt extrahieren.
+
+**Authentifizierung:** API-Key erforderlich (X-API-Key Header)
+
+**Parameter:**
+- `smime` (erforderlich): S/MIME Nachricht (PKCS#7 Format, PEM oder Base64)
+- `privateKey` (optional): PEM-kodierter Private Key für Entschlüsselung
+- `password` (optional): Passwort für verschlüsselten Private Key
+
+**Beispiel: Signierte Nachricht (ohne Verschlüsselung):**
+```bash
+curl -X POST https://tools.smobit.de/parse/smime \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key-here" \
+  -d '{
+    "smime": "-----BEGIN PKCS7-----\nMIIG...\n-----END PKCS7-----"
+  }'
+```
+
+**Beispiel: Verschlüsselte Nachricht (mit Private Key):**
+```bash
+curl -X POST https://tools.smobit.de/parse/smime \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key-here" \
+  -d '{
+    "smime": "-----BEGIN PKCS7-----\nMIIG...\n-----END PKCS7-----",
+    "privateKey": "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----",
+    "password": "optional-key-password"
+  }'
+```
+
+**Response (Signiert):**
+```json
+{
+  "success": true,
+  "type": "signed",
+  "content": "Entschlüsselter/Extrahierter Text...",
+  "certificates": [
+    {
+      "subject": [{"name": "commonName", "value": "John Doe"}],
+      "issuer": [{"name": "commonName", "value": "CA"}],
+      "serialNumber": "1234567890",
+      "validity": {
+        "notBefore": "2024-01-01T00:00:00.000Z",
+        "notAfter": "2025-01-01T00:00:00.000Z"
+      }
+    }
+  ],
+  "signers": [],
+  "recipients": []
+}
+```
+
+**Response (Verschlüsselt):**
+```json
+{
+  "success": true,
+  "type": "encrypted",
+  "content": "Entschlüsselter Text...",
+  "certificates": [],
+  "signers": [],
+  "recipients": [
+    {
+      "serialNumber": "1234567890",
+      "issuer": "..."
+    }
+  ]
+}
+```
+
+**Fehler Response:**
+```json
+{
+  "error": "Private key required",
+  "message": "This S/MIME message is encrypted. Please provide a privateKey parameter to decrypt it."
+}
+```
+
 ## n8n Integration
 
 ### HTTP Request Node Konfiguration
@@ -236,6 +317,7 @@ Vergiss nicht, die neue Tool-Definition in `/tools` zu ergänzen!
 - Express.js
 - express-rate-limit (Rate Limiting)
 - pdf-parse (PDF Parsing)
+- node-forge (S/MIME, Crypto, Zertifikate)
 - axios (HTTP Client)
 
 ## Lizenz

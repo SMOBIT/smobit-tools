@@ -2,6 +2,7 @@ const express = require('express');
 const pdf = require('pdf-parse');
 const axios = require('axios');
 const rateLimit = require('express-rate-limit');
+const forge = require('node-forge');
 
 const app = express();
 
@@ -70,6 +71,7 @@ app.get('/', (req, res) => {
     endpoints: {
       health: 'GET /health - Health check (no auth required)',
       parsePdf: 'POST /parse/pdf - Parse PDF from URL or base64 (auth required)',
+      parseSmime: 'POST /parse/smime - Parse S/MIME encrypted/signed messages (auth required)',
       tools: 'GET /tools - List available tools (no auth required)'
     }
   });
@@ -90,6 +92,20 @@ app.get('/tools', (req, res) => {
         parameters: {
           url: 'URL to PDF file (optional)',
           base64: 'Base64 encoded PDF data (optional)'
+        }
+      },
+      {
+        name: 'S/MIME Parser',
+        endpoint: '/parse/smime',
+        method: 'POST',
+        description: 'Parse and decrypt S/MIME encrypted/signed messages',
+        authentication: 'Required (X-API-Key header)',
+        rateLimit: '100 requests per 15 minutes',
+        maxFileSize: '10MB',
+        parameters: {
+          smime: 'S/MIME message content (required)',
+          privateKey: 'PEM encoded private key for decryption (optional)',
+          password: 'Password for encrypted private key (optional)'
         }
       }
     ]
@@ -160,11 +176,162 @@ app.post('/parse/pdf', authenticateApiKey, async (req, res) => {
   }
 });
 
+// S/MIME Parser Endpoint (mit API-Key Authentifizierung)
+app.post('/parse/smime', authenticateApiKey, async (req, res) => {
+  try {
+    const { smime, privateKey, password } = req.body;
+
+    if (!smime) {
+      return res.status(400).json({
+        error: 'S/MIME content is required',
+        message: 'Please provide the smime parameter with the S/MIME message content'
+      });
+    }
+
+    // S/MIME Nachricht als PEM verarbeiten
+    let p7;
+    try {
+      // PKCS7 Nachricht aus PEM oder raw format parsen
+      if (smime.includes('-----BEGIN')) {
+        const msg = forge.pki.messageFromPem(smime);
+        p7 = forge.pkcs7.messageFromPem(smime);
+      } else {
+        // Versuche als base64 zu dekodieren
+        const der = forge.util.decode64(smime);
+        const asn1 = forge.asn1.fromDer(der);
+        p7 = forge.pkcs7.messageFromAsn1(asn1);
+      }
+    } catch (e) {
+      return res.status(400).json({
+        error: 'Invalid S/MIME format',
+        message: 'Could not parse S/MIME message. Please provide valid PKCS#7/S/MIME format.',
+        details: e.message
+      });
+    }
+
+    const result = {
+      success: true,
+      type: null,
+      content: null,
+      certificates: [],
+      signers: [],
+      recipients: []
+    };
+
+    // Prüfe ob signiert
+    if (p7.type === forge.pki.oids.signedData) {
+      result.type = 'signed';
+
+      // Extrahiere Zertifikate
+      if (p7.certificates && p7.certificates.length > 0) {
+        result.certificates = p7.certificates.map(cert => ({
+          subject: cert.subject.attributes.map(attr => ({
+            name: attr.name,
+            value: attr.value
+          })),
+          issuer: cert.issuer.attributes.map(attr => ({
+            name: attr.name,
+            value: attr.value
+          })),
+          serialNumber: cert.serialNumber,
+          validity: {
+            notBefore: cert.validity.notBefore,
+            notAfter: cert.validity.notAfter
+          }
+        }));
+      }
+
+      // Extrahiere Signer-Informationen
+      if (p7.rawCapture && p7.rawCapture.content) {
+        result.content = p7.rawCapture.content.toString('utf8');
+      }
+    }
+
+    // Prüfe ob verschlüsselt (envelopedData)
+    if (p7.type === forge.pki.oids.envelopedData) {
+      result.type = 'encrypted';
+
+      if (!privateKey) {
+        return res.status(400).json({
+          error: 'Private key required',
+          message: 'This S/MIME message is encrypted. Please provide a privateKey parameter to decrypt it.'
+        });
+      }
+
+      try {
+        // Private Key laden
+        let pkey;
+        if (password) {
+          pkey = forge.pki.decryptRsaPrivateKey(privateKey, password);
+        } else {
+          pkey = forge.pki.privateKeyFromPem(privateKey);
+        }
+
+        if (!pkey) {
+          return res.status(400).json({
+            error: 'Invalid private key',
+            message: 'Could not load private key. Check format and password.'
+          });
+        }
+
+        // Entschlüsseln
+        p7.decrypt(p7.recipients[0], pkey);
+        result.content = p7.content.toString('utf8');
+
+        // Empfänger-Informationen
+        result.recipients = p7.recipients.map(recipient => ({
+          serialNumber: recipient.serialNumber,
+          issuer: recipient.issuer
+        }));
+
+      } catch (e) {
+        return res.status(400).json({
+          error: 'Decryption failed',
+          message: 'Could not decrypt S/MIME message. Check if the private key matches the recipient.',
+          details: e.message
+        });
+      }
+    }
+
+    // Signiert UND verschlüsselt (erst entschlüsseln, dann verifizieren)
+    if (p7.type === forge.pki.oids.envelopedData && result.content) {
+      try {
+        const innerP7 = forge.pkcs7.messageFromPem(result.content);
+        if (innerP7.type === forge.pki.oids.signedData) {
+          result.type = 'encrypted-and-signed';
+          if (innerP7.rawCapture && innerP7.rawCapture.content) {
+            result.content = innerP7.rawCapture.content.toString('utf8');
+          }
+        }
+      } catch (e) {
+        // Kein inneres signiertes Format, verwende bereits entschlüsselten Content
+      }
+    }
+
+    if (!result.content) {
+      return res.status(400).json({
+        error: 'Could not extract content',
+        message: 'S/MIME message type not supported or content could not be extracted'
+      });
+    }
+
+    res.json(result);
+
+  } catch (error) {
+    console.error('S/MIME parsing error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to parse S/MIME message',
+      message: error.message
+    });
+  }
+});
+
 // 404 Handler
 app.use((req, res) => {
   res.status(404).json({
     error: 'Endpoint not found',
-    availableEndpoints: ['/', '/health', '/tools', '/parse/pdf']
+    availableEndpoints: ['/', '/health', '/tools', '/parse/pdf', '/parse/smime']
   });
 });
 
