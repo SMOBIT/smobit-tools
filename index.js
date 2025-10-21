@@ -98,15 +98,16 @@ app.get('/tools', (req, res) => {
         name: 'S/MIME Parser',
         endpoint: '/parse/smime',
         method: 'POST',
-        description: 'Parse and decrypt S/MIME encrypted/signed messages',
+        description: 'Parse and decrypt S/MIME encrypted/signed messages (supports Base64 from n8n)',
         authentication: 'Required (X-API-Key header)',
         rateLimit: '100 requests per 15 minutes',
         maxFileSize: '10MB',
         parameters: {
-          smime: 'S/MIME message content (required)',
+          smime: 'S/MIME message content - PEM, Base64, or raw binary (required)',
           privateKey: 'PEM encoded private key for decryption (optional)',
           password: 'Password for encrypted private key (optional)'
-        }
+        },
+        note: 'Automatically decodes Base64-encoded S/MIME data - perfect for n8n integration!'
       }
     ]
   });
@@ -188,16 +189,29 @@ app.post('/parse/smime', authenticateApiKey, async (req, res) => {
       });
     }
 
+    let smimeContent = smime;
+
+    // Wenn die Daten Base64-encoded sind (von n8n), erst dekodieren
+    if (!smime.includes('-----BEGIN') && !smime.includes('\n')) {
+      try {
+        // Versuche als Base64-encoded S/MIME zu dekodieren
+        smimeContent = Buffer.from(smime, 'base64').toString('utf8');
+        console.log('Decoded Base64 S/MIME data');
+      } catch (e) {
+        // Falls Dekodierung fehlschlägt, verwende Original
+        console.log('Could not decode as Base64, using original data');
+      }
+    }
+
     // S/MIME Nachricht als PEM verarbeiten
     let p7;
     try {
       // PKCS7 Nachricht aus PEM oder raw format parsen
-      if (smime.includes('-----BEGIN')) {
-        const msg = forge.pki.messageFromPem(smime);
-        p7 = forge.pkcs7.messageFromPem(smime);
+      if (smimeContent.includes('-----BEGIN')) {
+        p7 = forge.pkcs7.messageFromPem(smimeContent);
       } else {
-        // Versuche als base64 zu dekodieren
-        const der = forge.util.decode64(smime);
+        // Versuche als base64/DER zu dekodieren
+        const der = forge.util.decode64(smimeContent);
         const asn1 = forge.asn1.fromDer(der);
         p7 = forge.pkcs7.messageFromAsn1(asn1);
       }
@@ -205,7 +219,8 @@ app.post('/parse/smime', authenticateApiKey, async (req, res) => {
       return res.status(400).json({
         error: 'Invalid S/MIME format',
         message: 'Could not parse S/MIME message. Please provide valid PKCS#7/S/MIME format.',
-        details: e.message
+        details: e.message,
+        hint: 'S/MIME data can be provided as PEM format, Base64-encoded, or raw binary data'
       });
     }
 

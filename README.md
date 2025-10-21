@@ -184,9 +184,14 @@ S/MIME verschlüsselte oder signierte Nachrichten entpacken und Inhalt extrahier
 **Authentifizierung:** API-Key erforderlich (X-API-Key Header)
 
 **Parameter:**
-- `smime` (erforderlich): S/MIME Nachricht (PKCS#7 Format, PEM oder Base64)
+- `smime` (erforderlich): S/MIME Nachricht - akzeptiert folgende Formate:
+  - PEM Format: `-----BEGIN PKCS7-----\n...\n-----END PKCS7-----`
+  - Base64-encoded (perfekt für n8n!): `LS0tLS1CRUdJTi...`
+  - Raw binary data
 - `privateKey` (optional): PEM-kodierter Private Key für Entschlüsselung
 - `password` (optional): Passwort für verschlüsselten Private Key
+
+**Wichtig für n8n:** Der Endpoint dekodiert automatisch Base64-encoded S/MIME Daten! Du kannst die Datei in n8n als Base64 lesen und direkt senden.
 
 **Beispiel: Signierte Nachricht (ohne Verschlüsselung):**
 ```bash
@@ -195,6 +200,16 @@ curl -X POST https://tools.smobit.de/parse/smime \
   -H "X-API-Key: your-api-key-here" \
   -d '{
     "smime": "-----BEGIN PKCS7-----\nMIIG...\n-----END PKCS7-----"
+  }'
+```
+
+**Beispiel: Base64-encoded S/MIME (perfekt für n8n):**
+```bash
+curl -X POST https://tools.smobit.de/parse/smime \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key-here" \
+  -d '{
+    "smime": "LS0tLS1CRUdJTiBQS0NTNy0tLS0tCk1JSUd..."
   }'
 ```
 
