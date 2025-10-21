@@ -1,9 +1,51 @@
 const express = require('express');
 const pdf = require('pdf-parse');
 const axios = require('axios');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+
+// API Key aus Environment Variable (WICHTIG: In Coolify setzen!)
+const API_KEY = process.env.API_KEY || 'change-me-in-production';
+
+// Rate Limiting: Max 100 Requests pro 15 Minuten
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 Minuten
+  max: 100, // Max 100 Requests
+  message: {
+    error: 'Too many requests, please try again later.',
+    retryAfter: '15 minutes'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Rate Limit für API-Endpoints
+app.use('/parse/', limiter);
+
+// Body Parser mit Size Limit (10MB)
+app.use(express.json({ limit: '10mb' }));
+
+// API-Key Authentifizierung Middleware
+const authenticateApiKey = (req, res, next) => {
+  const apiKey = req.headers['x-api-key'];
+
+  if (!apiKey) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'API-Key required. Please provide X-API-Key header.'
+    });
+  }
+
+  if (apiKey !== API_KEY) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Invalid API-Key'
+    });
+  }
+
+  next();
+};
 
 // Health Check Endpoint
 app.get('/health', (req, res) => {
@@ -20,10 +62,15 @@ app.get('/', (req, res) => {
   res.json({
     name: 'SMOBIT Tools API',
     version: '1.0.0',
+    security: {
+      authentication: 'API-Key required (X-API-Key header)',
+      rateLimit: '100 requests per 15 minutes',
+      maxFileSize: '10MB'
+    },
     endpoints: {
-      health: 'GET /health - Health check',
-      parsePdf: 'POST /parse/pdf - Parse PDF from URL or base64',
-      tools: 'GET /tools - List available tools'
+      health: 'GET /health - Health check (no auth required)',
+      parsePdf: 'POST /parse/pdf - Parse PDF from URL or base64 (auth required)',
+      tools: 'GET /tools - List available tools (no auth required)'
     }
   });
 });
@@ -37,6 +84,9 @@ app.get('/tools', (req, res) => {
         endpoint: '/parse/pdf',
         method: 'POST',
         description: 'Parse PDF files from URL or base64 data',
+        authentication: 'Required (X-API-Key header)',
+        rateLimit: '100 requests per 15 minutes',
+        maxFileSize: '10MB',
         parameters: {
           url: 'URL to PDF file (optional)',
           base64: 'Base64 encoded PDF data (optional)'
@@ -46,8 +96,8 @@ app.get('/tools', (req, res) => {
   });
 });
 
-// PDF Parser Endpoint
-app.post('/parse/pdf', async (req, res) => {
+// PDF Parser Endpoint (mit API-Key Authentifizierung)
+app.post('/parse/pdf', authenticateApiKey, async (req, res) => {
   try {
     const { url, base64 } = req.body;
 
@@ -61,9 +111,25 @@ app.post('/parse/pdf', async (req, res) => {
 
     // PDF von URL laden
     if (url) {
+      // URL Validierung
+      try {
+        const urlObj = new URL(url);
+        if (!['http:', 'https:'].includes(urlObj.protocol)) {
+          return res.status(400).json({
+            error: 'Invalid URL protocol. Only HTTP and HTTPS are allowed.'
+          });
+        }
+      } catch (e) {
+        return res.status(400).json({
+          error: 'Invalid URL format'
+        });
+      }
+
       const response = await axios.get(url, {
         responseType: 'arraybuffer',
-        timeout: 30000
+        timeout: 30000,
+        maxContentLength: 10 * 1024 * 1024, // Max 10MB
+        maxBodyLength: 10 * 1024 * 1024
       });
       dataBuffer = Buffer.from(response.data);
     }
