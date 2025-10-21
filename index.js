@@ -71,7 +71,7 @@ app.get('/', (req, res) => {
     endpoints: {
       health: 'GET /health - Health check (no auth required)',
       parsePdf: 'POST /parse/pdf - Parse PDF from URL or base64 (auth required)',
-      parseSmime: 'POST /parse/smime - Parse S/MIME encrypted/signed messages (auth required)',
+      parseSmime: 'POST /parse/smime - Parse S/MIME signed emails - supports complete multipart/signed emails (auth required)',
       tools: 'GET /tools - List available tools (no auth required)'
     }
   });
@@ -98,16 +98,16 @@ app.get('/tools', (req, res) => {
         name: 'S/MIME Parser',
         endpoint: '/parse/smime',
         method: 'POST',
-        description: 'Parse and decrypt S/MIME encrypted/signed messages (supports Base64 from n8n)',
+        description: 'Parse S/MIME signed/encrypted messages - supports complete emails (multipart/signed)',
         authentication: 'Required (X-API-Key header)',
         rateLimit: '100 requests per 15 minutes',
         maxFileSize: '10MB',
         parameters: {
-          smime: 'S/MIME message content - PEM, Base64, or raw binary (required)',
+          smime: 'S/MIME content - complete email, PEM, Base64, or raw binary (required)',
           privateKey: 'PEM encoded private key for decryption (optional)',
           password: 'Password for encrypted private key (optional)'
         },
-        note: 'Automatically decodes Base64-encoded S/MIME data - perfect for n8n integration!'
+        note: 'NEW: Send complete multipart/signed emails! Automatically extracts PKCS#7 signature and email content.'
       }
     ]
   });
@@ -177,6 +177,73 @@ app.post('/parse/pdf', authenticateApiKey, async (req, res) => {
   }
 });
 
+// Helper: Parse multipart/signed email and extract PKCS#7 signature
+function extractPKCS7FromEmail(emailContent) {
+  // Prüfe ob es eine multipart/signed E-Mail ist
+  if (!emailContent.includes('multipart/signed') && !emailContent.includes('application/pkcs7-signature')) {
+    return null; // Kein multipart/signed Format
+  }
+
+  // Suche nach dem PKCS7-Signatur-Teil
+  const lines = emailContent.split('\n');
+  let inSignaturePart = false;
+  let signatureBase64 = [];
+  let extractedContent = [];
+  let inContentPart = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Finde den Signatur-Teil
+    if (line.includes('Content-Type: application/pkcs7-signature') ||
+        line.includes('Content-Type: application/x-pkcs7-signature')) {
+      inSignaturePart = true;
+      // Überspringe Header bis zur leeren Zeile
+      while (i < lines.length && lines[i].trim() !== '') {
+        i++;
+      }
+      continue;
+    }
+
+    // Sammle Base64-Daten der Signatur
+    if (inSignaturePart && line.trim() !== '' && !line.startsWith('--')) {
+      signatureBase64.push(line.trim());
+    }
+
+    // Ende der Signatur erreicht
+    if (inSignaturePart && line.startsWith('--')) {
+      inSignaturePart = false;
+    }
+
+    // Extrahiere den eigentlichen Content (text/plain oder text/html)
+    if ((line.includes('Content-Type: text/plain') || line.includes('Content-Type: text/html')) && !inContentPart) {
+      inContentPart = true;
+      // Überspringe Header
+      while (i < lines.length && lines[i].trim() !== '') {
+        i++;
+      }
+      continue;
+    }
+
+    if (inContentPart && !line.startsWith('--')) {
+      extractedContent.push(line);
+    }
+
+    if (inContentPart && line.startsWith('--')) {
+      inContentPart = false;
+    }
+  }
+
+  if (signatureBase64.length > 0) {
+    return {
+      signature: signatureBase64.join(''),
+      content: extractedContent.join('\n').trim()
+    };
+  }
+
+  return null;
+}
+
 // S/MIME Parser Endpoint (mit API-Key Authentifizierung)
 app.post('/parse/smime', authenticateApiKey, async (req, res) => {
   try {
@@ -190,6 +257,7 @@ app.post('/parse/smime', authenticateApiKey, async (req, res) => {
     }
 
     let smimeContent = smime;
+    let extractedEmailContent = null;
 
     // Wenn die Daten Base64-encoded sind (von n8n), erst dekodieren
     if (!smime.includes('-----BEGIN') && !smime.includes('\n')) {
@@ -201,6 +269,14 @@ app.post('/parse/smime', authenticateApiKey, async (req, res) => {
         // Falls Dekodierung fehlschlägt, verwende Original
         console.log('Could not decode as Base64, using original data');
       }
+    }
+
+    // Prüfe ob es eine komplette E-Mail ist (multipart/signed)
+    const emailParts = extractPKCS7FromEmail(smimeContent);
+    if (emailParts) {
+      console.log('Detected multipart/signed email, extracting PKCS#7 signature part');
+      smimeContent = emailParts.signature;
+      extractedEmailContent = emailParts.content;
     }
 
     // S/MIME Nachricht als PEM verarbeiten
@@ -220,7 +296,7 @@ app.post('/parse/smime', authenticateApiKey, async (req, res) => {
         error: 'Invalid S/MIME format',
         message: 'Could not parse S/MIME message. Please provide valid PKCS#7/S/MIME format.',
         details: e.message,
-        hint: 'S/MIME data can be provided as PEM format, Base64-encoded, or raw binary data'
+        hint: 'S/MIME data can be provided as PEM format, Base64-encoded, multipart/signed email, or raw binary data'
       });
     }
 
@@ -256,8 +332,11 @@ app.post('/parse/smime', authenticateApiKey, async (req, res) => {
         }));
       }
 
-      // Extrahiere Signer-Informationen
-      if (p7.rawCapture && p7.rawCapture.content) {
+      // Extrahiere Signer-Informationen und Content
+      // Wenn wir den Content bereits aus der multipart/signed E-Mail extrahiert haben, nutze den
+      if (extractedEmailContent) {
+        result.content = extractedEmailContent;
+      } else if (p7.rawCapture && p7.rawCapture.content) {
         result.content = p7.rawCapture.content.toString('utf8');
       }
     }

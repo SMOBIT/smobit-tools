@@ -185,13 +185,17 @@ S/MIME verschlüsselte oder signierte Nachrichten entpacken und Inhalt extrahier
 
 **Parameter:**
 - `smime` (erforderlich): S/MIME Nachricht - akzeptiert folgende Formate:
+  - **Komplette E-Mail** (multipart/signed) - **NEU!** Extrahiert automatisch die Signatur
   - PEM Format: `-----BEGIN PKCS7-----\n...\n-----END PKCS7-----`
   - Base64-encoded (perfekt für n8n!): `LS0tLS1CRUdJTi...`
   - Raw binary data
 - `privateKey` (optional): PEM-kodierter Private Key für Entschlüsselung
 - `password` (optional): Passwort für verschlüsselten Private Key
 
-**Wichtig für n8n:** Der Endpoint dekodiert automatisch Base64-encoded S/MIME Daten! Du kannst die Datei in n8n als Base64 lesen und direkt senden.
+**Wichtig für n8n:**
+- Sende einfach die **komplette E-Mail** als Base64 - der Endpoint extrahiert automatisch die PKCS#7 Signatur!
+- Du musst nicht manuell den Signatur-Teil extrahieren
+- Funktioniert direkt mit E-Mail-Nodes in n8n
 
 **Beispiel: Signierte Nachricht (ohne Verschlüsselung):**
 ```bash
