@@ -1,12 +1,19 @@
 {
   "name": "smobit-tools",
   "version": "1.0.0",
+  "description": "Tool-Server mit verschiedenen APIs (PDF-Parser, etc.) fuer n8n Integration",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "dependencies": {
-    "express": "^4.x"
+    "express": "^4.18.2",
+    "pdf-parse": "^1.1.1",
+    "axios": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
 
