@@ -3,8 +3,27 @@ const pdf = require('pdf-parse');
 const axios = require('axios');
 const rateLimit = require('express-rate-limit');
 const forge = require('node-forge');
+const mammoth = require('mammoth');
+const cheerio = require('cheerio');
+const multer = require('multer');
 
 const app = express();
+
+// Multer Setup für File Upload (Memory Storage)
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 30 * 1024 * 1024 // Max 30MB
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only .docx files are allowed'));
+    }
+  }
+});
 
 // API Key aus Environment Variable (WICHTIG: In Coolify setzen!)
 const API_KEY = process.env.API_KEY || 'change-me-in-production';
@@ -23,6 +42,8 @@ const limiter = rateLimit({
 
 // Rate Limit für API-Endpoints
 app.use('/parse/', limiter);
+app.use('/convert-to-html', limiter);
+app.use('/parse-html', limiter);
 
 // Body Parser mit Size Limit (10MB)
 app.use(express.json({ limit: '10mb' }));
@@ -72,6 +93,8 @@ app.get('/', (req, res) => {
       health: 'GET /health - Health check (no auth required)',
       parsePdf: 'POST /parse/pdf - Parse PDF from URL or base64 (auth required)',
       parseSmime: 'POST /parse/smime - Parse S/MIME signed emails - supports complete multipart/signed emails (auth required)',
+      convertToHtml: 'POST /convert-to-html - Convert DOCX to HTML (auth required, multipart/form-data)',
+      parseHtml: 'POST /parse-html - Parse HTML into structured JSON with tables and paragraphs (auth required)',
       tools: 'GET /tools - List available tools (no auth required)'
     }
   });
@@ -108,6 +131,34 @@ app.get('/tools', (req, res) => {
           password: 'Password for encrypted private key (optional)'
         },
         note: 'NEW: Send complete multipart/signed emails! Automatically extracts PKCS#7 signature and email content.'
+      },
+      {
+        name: 'DOCX to HTML Converter',
+        endpoint: '/convert-to-html',
+        method: 'POST',
+        description: 'Convert DOCX files to HTML while preserving structure (especially tables)',
+        authentication: 'Required (X-API-Key header)',
+        rateLimit: '100 requests per 15 minutes',
+        maxFileSize: '30MB',
+        contentType: 'multipart/form-data',
+        parameters: {
+          document: 'DOCX file (binary upload, field name: document)'
+        },
+        output: 'HTML content with tables and formatting preserved'
+      },
+      {
+        name: 'HTML Parser',
+        endpoint: '/parse-html',
+        method: 'POST',
+        description: 'Parse HTML into structured JSON with tables (row/column indices) and paragraphs extracted',
+        authentication: 'Required (X-API-Key header)',
+        rateLimit: '100 requests per 15 minutes',
+        maxFileSize: '10MB',
+        parameters: {
+          html: 'HTML content string (required)'
+        },
+        output: 'Structured JSON with tables array (with cell positions) and paragraphs array',
+        note: 'Deterministic parsing - same input always produces same output. No interpretation, just structural extraction.'
       }
     ]
   });
@@ -421,11 +472,131 @@ app.post('/parse/smime', authenticateApiKey, async (req, res) => {
   }
 });
 
+// DOCX to HTML Converter Endpoint (mit API-Key Authentifizierung)
+app.post('/convert-to-html', authenticateApiKey, upload.single('document'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No file uploaded',
+        message: 'Please upload a .docx file with field name "document"'
+      });
+    }
+
+    // Convert DOCX to HTML using mammoth
+    const result = await mammoth.convertToHtml(
+      { buffer: req.file.buffer },
+      {
+        // Preserve tables and structure
+        includeDefaultStyleMap: true,
+        includeEmbeddedStyleMap: true
+      }
+    );
+
+    res.json({
+      success: true,
+      html: result.value,
+      metadata: {
+        messages: result.messages,
+        size: req.file.size
+      }
+    });
+
+  } catch (error) {
+    console.error('DOCX conversion error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to convert DOCX to HTML',
+      message: error.message
+    });
+  }
+});
+
+// HTML Parser Endpoint (mit API-Key Authentifizierung)
+app.post('/parse-html', authenticateApiKey, async (req, res) => {
+  try {
+    const { html } = req.body;
+
+    if (!html) {
+      return res.status(400).json({
+        success: false,
+        error: 'HTML content is required',
+        message: 'Please provide the html parameter with HTML content'
+      });
+    }
+
+    // Parse HTML with cheerio
+    const $ = cheerio.load(html);
+
+    // Extract all tables
+    const tables = [];
+    $('table').each((tableIndex, tableElement) => {
+      const rows = [];
+      let maxColumns = 0;
+
+      $(tableElement).find('tr').each((rowIndex, rowElement) => {
+        const rowCells = [];
+
+        $(rowElement).find('td, th').each((colIndex, cellElement) => {
+          const cellText = $(cellElement).text().trim();
+          rowCells.push({
+            text: cellText,
+            column: colIndex,
+            row: rowIndex
+          });
+        });
+
+        if (rowCells.length > maxColumns) {
+          maxColumns = rowCells.length;
+        }
+
+        rows.push(rowCells);
+      });
+
+      tables.push({
+        index: tableIndex,
+        rows: rows,
+        columnCount: maxColumns,
+        rowCount: rows.length
+      });
+    });
+
+    // Extract all paragraphs
+    const paragraphs = [];
+    $('p').each((index, element) => {
+      const text = $(element).text().trim();
+      if (text) { // Only add non-empty paragraphs
+        paragraphs.push(text);
+      }
+    });
+
+    res.json({
+      success: true,
+      data: {
+        tables: tables,
+        paragraphs: paragraphs,
+        metadata: {
+          tableCount: tables.length,
+          paragraphCount: paragraphs.length
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('HTML parsing error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to parse HTML',
+      message: error.message
+    });
+  }
+});
+
 // 404 Handler
 app.use((req, res) => {
   res.status(404).json({
     error: 'Endpoint not found',
-    availableEndpoints: ['/', '/health', '/tools', '/parse/pdf', '/parse/smime']
+    availableEndpoints: ['/', '/health', '/tools', '/parse/pdf', '/parse/smime', '/convert-to-html', '/parse-html']
   });
 });
 
