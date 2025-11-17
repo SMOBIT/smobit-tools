@@ -93,7 +93,7 @@ app.get('/', (req, res) => {
       health: 'GET /health - Health check (no auth required)',
       parsePdf: 'POST /parse/pdf - Parse PDF from URL or base64 (auth required)',
       parseSmime: 'POST /parse/smime - Parse S/MIME signed emails - supports complete multipart/signed emails (auth required)',
-      convertToHtml: 'POST /convert-to-html - Convert DOCX to HTML (auth required, multipart/form-data)',
+      convertToHtml: 'POST /convert-to-html - Convert DOCX to HTML (auth required, supports multipart/form-data or JSON with base64)',
       parseHtml: 'POST /parse-html - Parse HTML into structured JSON with tables and paragraphs (auth required)',
       tools: 'GET /tools - List available tools (no auth required)'
     }
@@ -140,11 +140,13 @@ app.get('/tools', (req, res) => {
         authentication: 'Required (X-API-Key header)',
         rateLimit: '100 requests per 15 minutes',
         maxFileSize: '30MB',
-        contentType: 'multipart/form-data',
+        contentType: 'multipart/form-data OR application/json',
         parameters: {
-          document: 'DOCX file (binary upload, field name: document)'
+          document: 'DOCX file (binary upload, field name: document) - for multipart/form-data',
+          base64: 'Base64 encoded DOCX data (optional) - for JSON requests'
         },
-        output: 'HTML content with tables and formatting preserved'
+        output: 'HTML content with tables and formatting preserved',
+        note: 'Supports both file upload (multipart/form-data) and Base64 JSON input'
       },
       {
         name: 'HTML Parser',
@@ -473,19 +475,61 @@ app.post('/parse/smime', authenticateApiKey, async (req, res) => {
 });
 
 // DOCX to HTML Converter Endpoint (mit API-Key Authentifizierung)
-app.post('/convert-to-html', authenticateApiKey, upload.single('document'), async (req, res) => {
+// Supports both multipart/form-data upload and JSON with base64
+app.post('/convert-to-html', authenticateApiKey, (req, res, next) => {
+  // Check if Content-Type is multipart/form-data
+  const contentType = req.headers['content-type'] || '';
+  if (contentType.includes('multipart/form-data')) {
+    // Use multer for file upload
+    upload.single('document')(req, res, next);
+  } else {
+    // Skip multer for JSON requests
+    next();
+  }
+}, async (req, res) => {
   try {
-    if (!req.file) {
+    let buffer;
+    let fileSize = 0;
+
+    // Check if file was uploaded via multipart/form-data
+    if (req.file) {
+      buffer = req.file.buffer;
+      fileSize = req.file.size;
+    }
+    // Check if base64 data was sent via JSON
+    else if (req.body && req.body.base64) {
+      try {
+        buffer = Buffer.from(req.body.base64, 'base64');
+        fileSize = buffer.length;
+
+        // Check file size limit (30MB)
+        if (fileSize > 30 * 1024 * 1024) {
+          return res.status(400).json({
+            success: false,
+            error: 'File too large',
+            message: 'Maximum file size is 30MB'
+          });
+        }
+      } catch (e) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid base64 data',
+          message: 'Could not decode base64 data'
+        });
+      }
+    }
+    // No file or base64 data provided
+    else {
       return res.status(400).json({
         success: false,
         error: 'No file uploaded',
-        message: 'Please upload a .docx file with field name "document"'
+        message: 'Please upload a .docx file with field name "document" (multipart/form-data) or provide "base64" parameter (JSON)'
       });
     }
 
     // Convert DOCX to HTML using mammoth
     const result = await mammoth.convertToHtml(
-      { buffer: req.file.buffer },
+      { buffer: buffer },
       {
         // Preserve tables and structure
         includeDefaultStyleMap: true,
@@ -498,7 +542,7 @@ app.post('/convert-to-html', authenticateApiKey, upload.single('document'), asyn
       html: result.value,
       metadata: {
         messages: result.messages,
-        size: req.file.size
+        size: fileSize
       }
     });
 
