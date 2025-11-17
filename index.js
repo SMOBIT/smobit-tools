@@ -94,7 +94,7 @@ app.get('/', (req, res) => {
       parsePdf: 'POST /parse/pdf - Parse PDF from URL or base64 (auth required)',
       parseSmime: 'POST /parse/smime - Parse S/MIME signed emails - supports complete multipart/signed emails (auth required)',
       convertToHtml: 'POST /convert-to-html - Convert DOCX to HTML (auth required, supports multipart/form-data or JSON with base64)',
-      parseHtml: 'POST /parse-html - Parse HTML into structured JSON with tables and paragraphs (auth required)',
+      parseHtml: 'POST /parse-html - Parse HTML into structured JSON with enhanced table parsing: lists, paragraphs, hierarchies (auth required)',
       tools: 'GET /tools - List available tools (no auth required)'
     }
   });
@@ -152,15 +152,23 @@ app.get('/tools', (req, res) => {
         name: 'HTML Parser',
         endpoint: '/parse-html',
         method: 'POST',
-        description: 'Parse HTML into structured JSON with tables (row/column indices) and paragraphs extracted',
+        description: 'Parse HTML into structured JSON with enhanced table cell parsing (lists, paragraphs, hierarchies)',
         authentication: 'Required (X-API-Key header)',
         rateLimit: '100 requests per 15 minutes',
         maxFileSize: '10MB',
         parameters: {
           html: 'HTML content string (required)'
         },
-        output: 'Structured JSON with tables array (with cell positions) and paragraphs array',
-        note: 'Deterministic parsing - same input always produces same output. No interpretation, just structural extraction.'
+        output: 'Structured JSON with tables array (with cell positions, lists, paragraphs, nested structures) and paragraphs array',
+        features: [
+          'Extracts lists (<ul>, <ol>) from table cells with nested list support',
+          'Preserves paragraph structure within cells',
+          'Detects line breaks (<br>) and multiple lines',
+          'HTML preprocessing for better text extraction (e.g., "1Stk" → "1 Stk")',
+          'Flags cells with structured content (has_structure)',
+          'Maintains backwards compatibility with plain text field'
+        ],
+        note: 'Enhanced parser with structure preservation. Deterministic - same input always produces same output.'
       }
     ]
   });
@@ -556,6 +564,109 @@ app.post('/convert-to-html', authenticateApiKey, (req, res, next) => {
   }
 });
 
+// Helper function to preprocess HTML for better parsing
+function preprocessHtml(html) {
+  return html
+    // Replace multiple tabs with single space
+    .replace(/\t+/g, ' ')
+
+    // Add space between lowercase and uppercase (e.g., "HerrTorsten" → "Herr Torsten")
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+
+    // Add space between number and uppercase (e.g., "1Stk" → "1 Stk")
+    .replace(/([0-9])([A-Z])/g, '$1 $2')
+
+    // Add space after period if followed by uppercase
+    .replace(/\.([A-Z])/g, '. $1')
+
+    // Normalize multiple spaces to single space
+    .replace(/\s{2,}/g, ' ')
+
+    .trim();
+}
+
+// Helper function to parse cell content with structure preservation
+function parseCellContent($, cellElement) {
+  const $cell = $(cellElement);
+
+  // Extract lists (ul, ol)
+  const lists = [];
+  $cell.find('ul, ol').each((listIndex, listElement) => {
+    const listType = listElement.tagName.toLowerCase(); // 'ul' or 'ol'
+    const items = [];
+
+    $(listElement).children('li').each((itemIndex, liElement) => {
+      const $li = $(liElement);
+
+      // Check for nested lists
+      const nestedLists = [];
+      $li.find('ul, ol').each((nestedIndex, nestedListElement) => {
+        const nestedType = nestedListElement.tagName.toLowerCase();
+        const nestedItems = [];
+
+        $(nestedListElement).children('li').each((nestedItemIndex, nestedLiElement) => {
+          nestedItems.push($(nestedLiElement).text().trim());
+        });
+
+        nestedLists.push({
+          type: nestedType,
+          items: nestedItems
+        });
+      });
+
+      // Get text without nested list text
+      let itemText = $li.clone();
+      itemText.find('ul, ol').remove();
+      itemText = itemText.text().trim();
+
+      const listItem = {
+        text: itemText
+      };
+
+      if (nestedLists.length > 0) {
+        listItem.nestedLists = nestedLists;
+      }
+
+      items.push(listItem);
+    });
+
+    lists.push({
+      type: listType,
+      items: items
+    });
+  });
+
+  // Extract paragraphs (direct p tags in cell)
+  const paragraphs = [];
+  $cell.children('p').each((pIndex, pElement) => {
+    const text = $(pElement).text().trim();
+    if (text) {
+      paragraphs.push(text);
+    }
+  });
+
+  // Extract line breaks - split by <br> tags
+  const htmlContent = $cell.html() || '';
+  const lines = htmlContent.split(/<br\s*\/?>/i).map(line => {
+    // Remove HTML tags from each line and trim
+    return cheerio.load(line).text().trim();
+  }).filter(line => line.length > 0);
+
+  // Get plain text as fallback
+  const plainText = $cell.text().trim();
+
+  // Determine if cell has structured content
+  const hasStructure = lists.length > 0 || paragraphs.length > 0 || (lines.length > 1);
+
+  return {
+    text: plainText,
+    lists: lists.length > 0 ? lists : undefined,
+    paragraphs: paragraphs.length > 0 ? paragraphs : undefined,
+    lines: lines.length > 1 ? lines : undefined, // Only include if multiple lines exist
+    has_structure: hasStructure ? true : undefined // Only include if true
+  };
+}
+
 // HTML Parser Endpoint (mit API-Key Authentifizierung)
 app.post('/parse-html', authenticateApiKey, async (req, res) => {
   try {
@@ -569,11 +680,16 @@ app.post('/parse-html', authenticateApiKey, async (req, res) => {
       });
     }
 
+    // Preprocess HTML for better text extraction
+    const cleanedHtml = preprocessHtml(html);
+
     // Parse HTML with cheerio
-    const $ = cheerio.load(html);
+    const $ = cheerio.load(cleanedHtml);
 
     // Extract all tables
     const tables = [];
+    let structuredCellCount = 0;
+
     $('table').each((tableIndex, tableElement) => {
       const rows = [];
       let maxColumns = 0;
@@ -582,11 +698,18 @@ app.post('/parse-html', authenticateApiKey, async (req, res) => {
         const rowCells = [];
 
         $(rowElement).find('td, th').each((colIndex, cellElement) => {
-          const cellText = $(cellElement).text().trim();
+          const cellContent = parseCellContent($, cellElement);
+
+          // Count structured cells
+          if (cellContent.has_structure) {
+            structuredCellCount++;
+          }
+
           rowCells.push({
-            text: cellText,
+            ...cellContent,
             column: colIndex,
-            row: rowIndex
+            row: rowIndex,
+            isHeader: cellElement.tagName.toLowerCase() === 'th'
           });
         });
 
@@ -621,7 +744,8 @@ app.post('/parse-html', authenticateApiKey, async (req, res) => {
         paragraphs: paragraphs,
         metadata: {
           tableCount: tables.length,
-          paragraphCount: paragraphs.length
+          paragraphCount: paragraphs.length,
+          structured_cells: structuredCellCount
         }
       }
     });
