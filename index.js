@@ -570,8 +570,10 @@ function preprocessHtml(html) {
     // Replace multiple tabs with single space
     .replace(/\t+/g, ' ')
 
-    // Add space between lowercase and uppercase (e.g., "HerrTorsten" → "Herr Torsten")
-    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    // Add space between lowercase and uppercase, but only if a new word starts
+    // (e.g., "HerrTorsten" → "Herr Torsten", but "GmbH" stays "GmbH")
+    // A new word is detected when uppercase is followed by lowercase
+    .replace(/([a-z])([A-Z][a-z])/g, '$1 $2')
 
     // Add space between number and uppercase (e.g., "1Stk" → "1 Stk")
     .replace(/([0-9])([A-Z])/g, '$1 $2')
