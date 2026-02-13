@@ -654,8 +654,16 @@ function parseCellContent($, cellElement) {
     return cheerio.load(line).text().trim();
   }).filter(line => line.length > 0);
 
-  // Get plain text as fallback
-  const plainText = $cell.text().trim();
+  // Get plain text with proper paragraph separation
+  // Replace </p> with \n\n (double newline) to preserve paragraph structure
+  // Replace <br> with \n (single newline) for simple line breaks
+  const cellHtml = $cell.html() || '';
+  const plainText = cellHtml
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 
   // Determine if cell has structured content
   const hasStructure = lists.length > 0 || paragraphs.length > 0 || (lines.length > 1);
