@@ -6,6 +6,7 @@ Tool-Server mit verschiedenen APIs für n8n Integration. Kann einfach über Cool
 
 - PDF Parser (URL oder Base64)
 - S/MIME Parser (verschlüsselte/signierte E-Mails entpacken)
+- PDF Compressor (Ghostscript-basierte Komprimierung)
 - API-Key Authentifizierung
 - Rate Limiting (100 Requests / 15 Min)
 - File-Size Limits (Max 10MB)
@@ -276,6 +277,43 @@ curl -X POST https://tools.smobit.de/parse/smime \
 }
 ```
 
+### POST /compress/pdf
+
+PDF komprimieren mit Ghostscript (ebook Preset, 150dpi). Reduziert die Dateigröße durch Bild-Resampling und Optimierung.
+
+**Authentifizierung:** API-Key erforderlich (X-API-Key Header)
+
+**Parameter:**
+- `base64` (erforderlich): Base64-encodiertes PDF
+
+**Beispiel:**
+```bash
+curl -X POST http://localhost:3000/compress/pdf \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key-here" \
+  -d '{"base64": "JVBERi0xLjQKJeLjz9MKMSAwIG9iago8PC..."}'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "base64": "JVBERi0xLjQK...",
+  "originalSize": 1234567,
+  "compressedSize": 456789,
+  "compressionRatio": "63.0%"
+}
+```
+
+**Fehler Response:**
+```json
+{
+  "success": false,
+  "error": "Failed to compress PDF",
+  "message": "Detailed error message"
+}
+```
+
 ## n8n Integration
 
 ### HTTP Request Node Konfiguration
@@ -338,6 +376,7 @@ Vergiss nicht, die neue Tool-Definition in `/tools` zu ergänzen!
 - pdf-parse (PDF Parsing)
 - node-forge (S/MIME, Crypto, Zertifikate)
 - axios (HTTP Client)
+- Ghostscript (PDF Komprimierung, via Alpine apk)
 
 ## Lizenz
 

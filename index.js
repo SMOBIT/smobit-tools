@@ -6,6 +6,13 @@ const forge = require('node-forge');
 const mammoth = require('mammoth');
 const cheerio = require('cheerio');
 const multer = require('multer');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const execFileAsync = promisify(execFile);
 
 const app = express();
 
@@ -44,6 +51,7 @@ const limiter = rateLimit({
 app.use('/parse/', limiter);
 app.use('/convert-to-html', limiter);
 app.use('/parse-html', limiter);
+app.use('/compress/', limiter);
 
 // Body Parser mit Size Limit (10MB)
 app.use(express.json({ limit: '10mb' }));
@@ -95,6 +103,7 @@ app.get('/', (req, res) => {
       parseSmime: 'POST /parse/smime - Parse S/MIME signed emails - supports complete multipart/signed emails (auth required)',
       convertToHtml: 'POST /convert-to-html - Convert DOCX to HTML (auth required, supports multipart/form-data or JSON with base64)',
       parseHtml: 'POST /parse-html - Parse HTML into structured JSON with enhanced table parsing: lists, paragraphs, hierarchies (auth required)',
+      compressPdf: 'POST /compress/pdf - Compress PDF with Ghostscript ebook preset (auth required)',
       tools: 'GET /tools - List available tools (no auth required)'
     }
   });
@@ -169,6 +178,19 @@ app.get('/tools', (req, res) => {
           'Maintains backwards compatibility with plain text field'
         ],
         note: 'Enhanced parser with structure preservation. Deterministic - same input always produces same output.'
+      },
+      {
+        name: 'PDF Compressor',
+        endpoint: '/compress/pdf',
+        method: 'POST',
+        description: 'Compress PDF files using Ghostscript ebook preset (150dpi)',
+        authentication: 'Required (X-API-Key header)',
+        rateLimit: '100 requests per 15 minutes',
+        maxFileSize: '10MB',
+        parameters: {
+          base64: 'Base64 encoded PDF data (required)'
+        },
+        output: 'Compressed PDF as base64 with size statistics (originalSize, compressedSize, compressionRatio)'
       }
     ]
   });
@@ -762,11 +784,107 @@ app.post('/parse-html', authenticateApiKey, async (req, res) => {
   }
 });
 
+// PDF Compressor Endpoint (mit API-Key Authentifizierung)
+app.post('/compress/pdf', authenticateApiKey, async (req, res) => {
+  try {
+    const { base64 } = req.body;
+
+    if (!base64) {
+      return res.status(400).json({
+        success: false,
+        error: 'Base64 PDF data is required',
+        message: 'Please provide the base64 parameter with base64-encoded PDF data'
+      });
+    }
+
+    // Decode base64 to buffer
+    let inputBuffer;
+    try {
+      inputBuffer = Buffer.from(base64, 'base64');
+    } catch (e) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid base64 data',
+        message: 'Could not decode base64 data'
+      });
+    }
+
+    const originalSize = inputBuffer.length;
+
+    // Check size limit (10MB)
+    if (originalSize > 10 * 1024 * 1024) {
+      return res.status(400).json({
+        success: false,
+        error: 'File too large',
+        message: 'Maximum file size is 10MB'
+      });
+    }
+
+    // Validate PDF magic bytes
+    if (inputBuffer.slice(0, 5).toString() !== '%PDF-') {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid PDF',
+        message: 'The provided data is not a valid PDF file'
+      });
+    }
+
+    // Create temp files
+    const tmpDir = os.tmpdir();
+    const timestamp = Date.now() + '-' + Math.random().toString(36).slice(2);
+    const inputPath = path.join(tmpDir, `input-${timestamp}.pdf`);
+    const outputPath = path.join(tmpDir, `output-${timestamp}.pdf`);
+
+    try {
+      // Write input PDF to temp file
+      fs.writeFileSync(inputPath, inputBuffer);
+
+      // Run Ghostscript compression
+      await execFileAsync('gs', [
+        '-sDEVICE=pdfwrite',
+        '-dCompatibilityLevel=1.4',
+        '-dPDFSETTINGS=/ebook',
+        '-dNOPAUSE',
+        '-dBATCH',
+        '-dQUIET',
+        `-sOutputFile=${outputPath}`,
+        inputPath
+      ], { timeout: 60000 });
+
+      // Read compressed output
+      const outputBuffer = fs.readFileSync(outputPath);
+      const compressedSize = outputBuffer.length;
+      const compressionRatio = ((1 - compressedSize / originalSize) * 100).toFixed(1) + '%';
+
+      res.json({
+        success: true,
+        base64: outputBuffer.toString('base64'),
+        originalSize,
+        compressedSize,
+        compressionRatio
+      });
+
+    } finally {
+      // Clean up temp files
+      try { fs.unlinkSync(inputPath); } catch (e) { /* ignore */ }
+      try { fs.unlinkSync(outputPath); } catch (e) { /* ignore */ }
+    }
+
+  } catch (error) {
+    console.error('PDF compression error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to compress PDF',
+      message: error.message
+    });
+  }
+});
+
 // 404 Handler
 app.use((req, res) => {
   res.status(404).json({
     error: 'Endpoint not found',
-    availableEndpoints: ['/', '/health', '/tools', '/parse/pdf', '/parse/smime', '/convert-to-html', '/parse-html']
+    availableEndpoints: ['/', '/health', '/tools', '/parse/pdf', '/parse/smime', '/convert-to-html', '/parse-html', '/compress/pdf']
   });
 });
 
