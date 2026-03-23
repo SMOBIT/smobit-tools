@@ -6,6 +6,11 @@ const forge = require('node-forge');
 const mammoth = require('mammoth');
 const cheerio = require('cheerio');
 const multer = require('multer');
+const { execFile } = require('child_process');
+const { writeFile, readFile, unlink } = require('fs/promises');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -42,6 +47,7 @@ const limiter = rateLimit({
 
 // Rate Limit für API-Endpoints
 app.use('/parse/', limiter);
+app.use('/compress/', limiter);
 app.use('/convert-to-html', limiter);
 app.use('/parse-html', limiter);
 
@@ -92,6 +98,7 @@ app.get('/', (req, res) => {
     endpoints: {
       health: 'GET /health - Health check (no auth required)',
       parsePdf: 'POST /parse/pdf - Parse PDF from URL or base64 (auth required)',
+      compressPdf: 'POST /compress/pdf - Compress PDF from URL or base64 using Ghostscript (auth required)',
       parseSmime: 'POST /parse/smime - Parse S/MIME signed emails - supports complete multipart/signed emails (auth required)',
       convertToHtml: 'POST /convert-to-html - Convert DOCX to HTML (auth required, supports multipart/form-data or JSON with base64)',
       parseHtml: 'POST /parse-html - Parse HTML into structured JSON with enhanced table parsing: lists, paragraphs, hierarchies (auth required)',
@@ -116,6 +123,21 @@ app.get('/tools', (req, res) => {
           url: 'URL to PDF file (optional)',
           base64: 'Base64 encoded PDF data (optional)'
         }
+      },
+      {
+        name: 'PDF Compressor',
+        endpoint: '/compress/pdf',
+        method: 'POST',
+        description: 'Compress PDF files using Ghostscript with selectable quality levels',
+        authentication: 'Required (X-API-Key header)',
+        rateLimit: '100 requests per 15 minutes',
+        maxFileSize: '50MB',
+        parameters: {
+          url: 'URL to PDF file (optional)',
+          base64: 'Base64 encoded PDF data (optional)',
+          quality: 'Compression quality: "screen" (72dpi), "ebook" (150dpi, default), "printer" (300dpi), "prepress" (300dpi, color fidelity)'
+        },
+        output: 'Compressed PDF as base64 with size comparison'
       },
       {
         name: 'S/MIME Parser',
@@ -235,6 +257,107 @@ app.post('/parse/pdf', authenticateApiKey, async (req, res) => {
       error: 'Failed to parse PDF',
       message: error.message
     });
+  }
+});
+
+// PDF Compress Endpoint (mit API-Key Authentifizierung)
+app.post('/compress/pdf', authenticateApiKey, async (req, res) => {
+  const inputPath = path.join(os.tmpdir(), `input-${crypto.randomUUID()}.pdf`);
+  const outputPath = path.join(os.tmpdir(), `output-${crypto.randomUUID()}.pdf`);
+
+  try {
+    const { url, base64, quality } = req.body;
+
+    if (!url && !base64) {
+      return res.status(400).json({
+        error: 'Either url or base64 parameter is required'
+      });
+    }
+
+    // Qualitätsstufe validieren
+    const validQualities = ['screen', 'ebook', 'printer', 'prepress'];
+    const selectedQuality = validQualities.includes(quality) ? quality : 'ebook';
+
+    let dataBuffer;
+
+    // PDF von URL laden
+    if (url) {
+      try {
+        const urlObj = new URL(url);
+        if (!['http:', 'https:'].includes(urlObj.protocol)) {
+          return res.status(400).json({
+            error: 'Invalid URL protocol. Only HTTP and HTTPS are allowed.'
+          });
+        }
+      } catch (e) {
+        return res.status(400).json({
+          error: 'Invalid URL format'
+        });
+      }
+
+      const response = await axios.get(url, {
+        responseType: 'arraybuffer',
+        timeout: 30000,
+        maxContentLength: 50 * 1024 * 1024,
+        maxBodyLength: 50 * 1024 * 1024
+      });
+      dataBuffer = Buffer.from(response.data);
+    }
+    // PDF von Base64 laden
+    else if (base64) {
+      dataBuffer = Buffer.from(base64, 'base64');
+    }
+
+    const originalSize = dataBuffer.length;
+
+    // Temporäre Dateien schreiben
+    await writeFile(inputPath, dataBuffer);
+
+    // Ghostscript ausführen
+    await new Promise((resolve, reject) => {
+      execFile('gs', [
+        '-sDEVICE=pdfwrite',
+        '-dCompatibilityLevel=1.4',
+        `-dPDFSETTINGS=/${selectedQuality}`,
+        '-dNOPAUSE',
+        '-dQUIET',
+        '-dBATCH',
+        `-sOutputFile=${outputPath}`,
+        inputPath
+      ], { timeout: 120000 }, (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(`Ghostscript error: ${error.message}`));
+        } else {
+          resolve();
+        }
+      });
+    });
+
+    // Komprimierte PDF lesen
+    const compressedBuffer = await readFile(outputPath);
+    const compressedSize = compressedBuffer.length;
+    const ratio = ((1 - compressedSize / originalSize) * 100).toFixed(1);
+
+    res.json({
+      success: true,
+      base64: compressedBuffer.toString('base64'),
+      originalSize,
+      compressedSize,
+      compressionRatio: `${ratio}%`,
+      quality: selectedQuality
+    });
+
+  } catch (error) {
+    console.error('PDF compression error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to compress PDF',
+      message: error.message
+    });
+  } finally {
+    // Temporäre Dateien aufräumen
+    await unlink(inputPath).catch(() => {});
+    await unlink(outputPath).catch(() => {});
   }
 });
 
@@ -766,7 +889,7 @@ app.post('/parse-html', authenticateApiKey, async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({
     error: 'Endpoint not found',
-    availableEndpoints: ['/', '/health', '/tools', '/parse/pdf', '/parse/smime', '/convert-to-html', '/parse-html']
+    availableEndpoints: ['/', '/health', '/tools', '/parse/pdf', '/compress/pdf', '/parse/smime', '/convert-to-html', '/parse-html']
   });
 });
 
