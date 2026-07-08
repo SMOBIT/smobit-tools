@@ -710,9 +710,74 @@ function preprocessHtml(html) {
     .trim();
 }
 
+// Helper: render inline HTML (text + bold/italic/br) to markdown-ish text
+function inlineToMarkdown($, el) {
+  let out = '';
+  $(el).contents().each((i, n) => {
+    if (n.type === 'text') {
+      out += n.data;
+    } else if (n.type === 'tag') {
+      const tag = n.tagName.toLowerCase();
+      const inner = inlineToMarkdown($, n);
+      if (tag === 'strong' || tag === 'b') {
+        out += inner.trim() ? '**' + inner.trim() + '** ' : '';
+      } else if (tag === 'br') {
+        out += '\n';
+      } else {
+        // em/i and everything else: keep plain text (no emphasis markers)
+        out += inner;
+      }
+    }
+  });
+  return out.replace(/[ \t]{2,}/g, ' ');
+}
+
+// Helper: render a <ul>/<ol> (with nesting) to markdown bullet lines
+function listToMarkdown($, listEl, depth) {
+  const lines = [];
+  $(listEl).children('li').each((i, li) => {
+    const $li = $(li).clone();
+    $li.find('ul, ol').remove();
+    const txt = inlineToMarkdown($, $li[0]).trim();
+    if (txt) lines.push('  '.repeat(depth) + '- ' + txt);
+    $(li).children('ul, ol').each((j, nested) => {
+      const sub = listToMarkdown($, nested, depth + 1);
+      if (sub) lines.push(sub);
+    });
+  });
+  return lines.join('\n');
+}
+
+// Helper: render a container (cell/body) to markdown, preserving the order of
+// paragraphs and (nested) lists. This is what lets us keep bullet lists that
+// the flat "paragraphs" extraction drops.
+function containerToMarkdown($, el) {
+  const parts = [];
+  $(el).children().each((i, c) => {
+    const tag = (c.tagName || c.name || '').toLowerCase();
+    if (tag === 'p') {
+      const s = inlineToMarkdown($, c).trim();
+      if (s) parts.push(s);
+    } else if (tag === 'ul' || tag === 'ol') {
+      const s = listToMarkdown($, c, 0);
+      if (s) parts.push(s);
+    } else if (tag === 'table') {
+      // nested tables are handled separately as structured tables
+    } else {
+      const s = containerToMarkdown($, c);
+      if (s) parts.push(s);
+    }
+  });
+  return parts.join('\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 // Helper function to parse cell content with structure preservation
 function parseCellContent($, cellElement) {
   const $cell = $(cellElement);
+
+  // Faithful markdown of the whole cell (paragraphs + nested bullet lists in
+  // document order). Preserves content the flat paragraph list would drop.
+  const markdown = containerToMarkdown($, cellElement);
 
   // Extract lists (ul, ol)
   const lists = [];
@@ -785,6 +850,7 @@ function parseCellContent($, cellElement) {
 
   return {
     text: plainText,
+    markdown: markdown && markdown !== plainText ? markdown : undefined, // ordered md (bullets/bold) when richer than plain text
     lists: lists.length > 0 ? lists : undefined,
     paragraphs: paragraphs.length > 0 ? paragraphs : undefined,
     lines: lines.length > 1 ? lines : undefined, // Only include if multiple lines exist
