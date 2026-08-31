@@ -5,6 +5,7 @@ Tool-Server mit verschiedenen APIs für n8n Integration. Kann einfach über Cool
 ## Features
 
 - PDF Parser (URL oder Base64)
+- DOCX → PDF, layoutgetreu (über Gotenberg)
 - S/MIME Parser (verschlüsselte/signierte E-Mails entpacken)
 - API-Key Authentifizierung
 - Rate Limiting (100 Requests / 15 Min)
@@ -276,6 +277,47 @@ curl -X POST https://tools.smobit.de/parse/smime \
 }
 ```
 
+## DOCX → PDF: Gotenberg daneben stellen
+
+`/convert-to-pdf` wandelt nicht selbst, sondern reicht an **Gotenberg** weiter —
+ein fertiges Image, in dem LibreOffice samt metrikkompatibler Schriften schon
+richtig eingerichtet ist.
+
+**Warum nicht LibreOffice in dieses Image?** Zwei Gründe, und der zweite ist der
+teurere:
+
+1. Das Image wüchse um ein Vielfaches, und **jeder** Deploy dieses Dienstes
+   trüge das mit — auch die, die mit Dokumenten nichts zu tun haben.
+2. Alpines LibreOffice ist bei Schriften heikel. Fehlen die metrikkompatiblen
+   Schriften (Liberation für Arial/Times), stimmen die Zeilenumbrüche nicht
+   mehr — und „layoutgetreu" ist genau der Zweck. Auffallen würde es erst beim
+   Bauen, und dann steht dieser Dienst.
+
+### Einrichtung in Coolify (derselbe Server)
+
+1. Neue Application → **Docker Image** → `gotenberg/gotenberg:8`
+2. **Nicht** öffentlich veröffentlichen. Gotenberg bringt keine
+   Authentifizierung mit; es soll nur von hier aus erreichbar sein.
+3. Beide Container ins selbe Netz, damit `http://gotenberg:3000` auflöst.
+4. Hier `GOTENBERG_URL` setzen (falls der Dienst anders heißt) und neu starten.
+
+### Probe
+
+```bash
+curl -X POST https://tools.smobit.de/convert-to-pdf \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d "{\"base64\":\"$(base64 -w0 rechnung.docx)\",\"dateiname\":\"rechnung.docx\"}" \
+  | python3 -c "import json,sys,base64; d=json.load(sys.stdin); open('raus.pdf','wb').write(base64.b64decode(d['base64']))"
+```
+
+Antwortet der Endpunkt **503**, läuft Gotenberg nicht oder `GOTENBERG_URL` zeigt
+woandershin — die Meldung nennt die Adresse, die versucht wurde.
+
+⚠️ **Der Dateiname zählt.** LibreOffice wählt den Eingabefilter über die
+Endung, nicht über den Inhalt. Ein Name ohne brauchbare Endung wird deshalb zu
+`.docx` ergänzt; wer PDFs aus `.doc`, `.odt` oder `.xlsx` will, schickt den
+echten Namen mit.
+
 ## n8n Integration
 
 ### HTTP Request Node Konfiguration
@@ -327,6 +369,7 @@ Vergiss nicht, die neue Tool-Definition in `/tools` zu ergänzen!
 
 - `PORT`: Server Port (default: 3000)
 - `API_KEY`: **WICHTIG!** API-Key für Authentifizierung (default: 'change-me-in-production')
+- `GOTENBERG_URL`: Adresse der Gotenberg-Instanz für `/convert-to-pdf` (default: `http://gotenberg:3000`). Ohne erreichbare Instanz antwortet **nur dieser eine** Endpunkt mit 503; alle anderen laufen weiter.
 
 **Security Warning:** Der Default API-Key sollte NIEMALS in Production verwendet werden! Setze immer einen sicheren API-Key in Coolify.
 
