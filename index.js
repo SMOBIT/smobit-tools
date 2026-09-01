@@ -50,6 +50,7 @@ app.use('/parse/', limiter);
 app.use('/compress/', limiter);
 app.use('/convert-to-html', limiter);
 app.use('/parse-html', limiter);
+app.use('/convert-to-pdf', limiter);
 
 // Body Parser mit Size Limit (10MB)
 app.use(express.json({ limit: '10mb' }));
@@ -169,6 +170,24 @@ app.get('/tools', (req, res) => {
         },
         output: 'HTML content with tables and formatting preserved',
         note: 'Supports both file upload (multipart/form-data) and Base64 JSON input'
+      },
+      {
+        name: 'Document to PDF Converter',
+        endpoint: '/convert-to-pdf',
+        method: 'POST',
+        description: 'Convert DOCX (and other office formats) to a layout-faithful PDF via Gotenberg',
+        authentication: 'Required (X-API-Key header)',
+        rateLimit: '100 requests per 15 minutes',
+        maxFileSize: '30MB',
+        contentType: 'multipart/form-data OR application/json',
+        parameters: {
+          document: 'Document file (binary upload, field name: document) - for multipart/form-data',
+          base64: 'Base64 encoded document (optional) - for JSON requests',
+          dateiname: 'Original file name (optional, JSON only). LibreOffice picks the input filter by extension, so a name without one is completed to .docx'
+        },
+        output: 'JSON with base64 encoded PDF',
+        requires: 'A Gotenberg instance reachable at GOTENBERG_URL (default http://gotenberg:3000). Returns 503 if it is not.',
+        note: 'Conversion runs in Gotenberg, not in this image - keeps LibreOffice and its fonts out of the deploy of this service'
       },
       {
         name: 'HTML Parser',
@@ -952,6 +971,138 @@ app.post('/parse-html', authenticateApiKey, async (req, res) => {
 });
 
 // 404 Handler
+// ============================================================================
+// DOCX -> PDF (layoutgetreu)
+// ============================================================================
+// Wofuer: Der Rechnungsimport von Hey.LooQ hinterlegt zu jedem Beleg das
+// Originaldokument. Zum ANSEHEN taugt eine .docx im Browser nicht, deshalb
+// entsteht daneben ein PDF.
+//
+// WARUM NICHT LIBREOFFICE IN DIESES IMAGE
+// ---------------------------------------
+// Naheliegend waere `apk add libreoffice-writer` und `execFile` wie beim
+// Ghostscript-Endpunkt darueber. Dagegen sprechen zwei Dinge:
+//
+//   1. Das Image waechst um ein Vielfaches, und JEDER Deploy dieses Dienstes
+//      traegt das mit — auch die, die mit Dokumenten nichts zu tun haben.
+//   2. Alpines LibreOffice ist bei Schriften heikel. Fehlen die
+//      metrikkompatiblen Schriften (Liberation fuer Arial/Times), stimmen
+//      Zeilenumbrueche nicht mehr — und „layoutgetreu" ist genau der Zweck.
+//      Ein Fehlschlag faellt ausserdem erst beim Bauen auf, und dann steht
+//      dieser Dienst, an dem der ganze Rechnungsimport haengt.
+//
+// Deshalb uebernimmt Gotenberg die Wandlung — ein fertiges Image, in dem
+// LibreOffice samt Schriften schon richtig eingerichtet ist. Es laeuft
+// NEBENAN und braucht nicht oeffentlich erreichbar zu sein; dieser Endpunkt
+// ist die Tuer davor und bringt die Authentifizierung mit, die es selbst
+// nicht hat.
+//
+// Einrichtung (Coolify, derselbe Server):
+//   · Neue Application aus dem Image `gotenberg/gotenberg:8`, NICHT oeffentlich
+//   · Hier `GOTENBERG_URL` setzen, z. B. http://gotenberg:3000
+const GOTENBERG_URL = (process.env.GOTENBERG_URL || 'http://gotenberg:3000').replace(/\/+$/, '');
+
+app.post('/convert-to-pdf', authenticateApiKey, (req, res, next) => {
+  const contentType = req.headers['content-type'] || '';
+  if (contentType.includes('multipart/form-data')) {
+    upload.single('document')(req, res, next);
+  } else {
+    next();
+  }
+}, async (req, res) => {
+  try {
+    let buffer;
+    let dateiname = 'dokument.docx';
+
+    if (req.file) {
+      buffer = req.file.buffer;
+      dateiname = req.file.originalname || dateiname;
+    } else if (req.body && req.body.base64) {
+      try {
+        buffer = Buffer.from(req.body.base64, 'base64');
+      } catch (e) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid base64 data',
+          message: 'Could not decode base64 data'
+        });
+      }
+      if (req.body.dateiname) dateiname = String(req.body.dateiname);
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: 'No file uploaded',
+        message: 'Please upload a document with field name "document" (multipart/form-data) or provide "base64" parameter (JSON)'
+      });
+    }
+
+    if (buffer.length > 30 * 1024 * 1024) {
+      return res.status(400).json({
+        success: false,
+        error: 'File too large',
+        message: 'Maximum file size is 30MB'
+      });
+    }
+
+    // LibreOffice geht nach der Endung, nicht nach dem Inhalt. Ein Name ohne
+    // brauchbare Endung liefert stumm ein leeres PDF — deshalb hier einen
+    // vernuenftigen Namen erzwingen statt drueben zu raten.
+    if (!/\.[a-z0-9]{2,5}$/i.test(dateiname)) dateiname += '.docx';
+
+    const form = new FormData();
+    form.append('files', new Blob([buffer]), dateiname);
+
+    let antwort;
+    try {
+      antwort = await axios.post(`${GOTENBERG_URL}/forms/libreoffice/convert`, form, {
+        responseType: 'arraybuffer',
+        timeout: 120000,
+        maxContentLength: 60 * 1024 * 1024,
+        maxBodyLength: 60 * 1024 * 1024,
+        validateStatus: () => true
+      });
+    } catch (e) {
+      // Nicht erreichbar heisst fast immer: Gotenberg laeuft nicht, oder
+      // GOTENBERG_URL zeigt woanders hin. Das als 500 zu melden wuerde beim
+      // Aufrufer nach einem kaputten Dokument aussehen — es ist aber die
+      // Einrichtung. 503 sagt das, und die Meldung nennt die Adresse.
+      return res.status(503).json({
+        success: false,
+        error: 'Converter unavailable',
+        message: `Gotenberg not reachable at ${GOTENBERG_URL}: ${e.message}`
+      });
+    }
+
+    if (antwort.status !== 200) {
+      const text = Buffer.from(antwort.data || '').toString('utf8').slice(0, 500);
+      return res.status(502).json({
+        success: false,
+        error: 'Conversion failed',
+        message: `Gotenberg answered ${antwort.status}: ${text}`
+      });
+    }
+
+    const pdf = Buffer.from(antwort.data);
+    res.json({
+      success: true,
+      base64: pdf.toString('base64'),
+      metadata: {
+        sourceName: dateiname,
+        sourceSize: buffer.length,
+        pdfSize: pdf.length
+      }
+    });
+
+  } catch (error) {
+    console.error('PDF conversion error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to convert document to PDF',
+      message: error.message
+    });
+  }
+});
+
 app.use((req, res) => {
   res.status(404).json({
     error: 'Endpoint not found',
